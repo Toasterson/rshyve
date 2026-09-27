@@ -10,6 +10,7 @@ pub mod direct;
 pub mod elf;
 pub mod image;
 pub mod initrd;
+pub mod multiboot2;
 pub mod pvh;
 
 use bhyve_api::{seg_desc, vm_reg_name};
@@ -25,6 +26,9 @@ pub use direct::{
 pub use elf::PvhKernel;
 pub use image::{detect_boot_protocol, BootImage, BootProtocol};
 pub use initrd::{place_initrd, LOWMEM_LIMIT};
+pub use multiboot2::{
+    load_multiboot2_kernel, setup_multiboot2_bsp, Multiboot2Kernel,
+};
 pub use pvh::{load_pvh_kernel, setup_pvh_bsp};
 
 /// The vCPU operations a boot protocol needs to place a guest at its

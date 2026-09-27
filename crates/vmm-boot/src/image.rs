@@ -15,6 +15,7 @@ use anyhow::{bail, Context, Result};
 use vmm_core::mem::MemCtx;
 
 use crate::elf::ELF_MAGIC;
+use crate::multiboot2::{find_multiboot2_header, Multiboot2Kernel};
 use crate::{BootVcpu, ImageBytes, InitrdImage, KernelImage, PvhKernel};
 
 const BZIMAGE_MAGIC_OFFSET: usize = 0x202;
@@ -30,6 +31,8 @@ pub enum BootProtocol {
     Bzimage,
     /// Xen PVH, 32-bit entry.
     Pvh,
+    /// Multiboot2 with address tags (illumos `unix`), 32-bit entry.
+    Multiboot2,
 }
 
 /// Classify a boot image from its first bytes.
@@ -39,7 +42,16 @@ pub enum BootProtocol {
 /// guest at an entry point that does not match its register state, which
 /// shows up as an unexplained triple fault.
 pub fn detect_boot_protocol(data: &[u8]) -> Result<BootProtocol> {
-    if data.len() >= ELF_MAGIC.len() && &data[..ELF_MAGIC.len()] == ELF_MAGIC {
+    let is_elf =
+        data.len() >= ELF_MAGIC.len() && &data[..ELF_MAGIC.len()] == ELF_MAGIC;
+    // An ELF with a Multiboot2 header but no Xen PVH note is a Multiboot2
+    // kernel (illumos `unix`). A PVH note wins when both are present.
+    if find_multiboot2_header(data).is_some()
+        && (!is_elf || PvhKernel::from_bytes(data.to_vec()).is_err())
+    {
+        return Ok(BootProtocol::Multiboot2);
+    }
+    if is_elf {
         return Ok(BootProtocol::Pvh);
     }
     if data.len() > BZIMAGE_MIN_LEN {
@@ -53,8 +65,8 @@ pub fn detect_boot_protocol(data: &[u8]) -> Result<BootProtocol> {
         }
     }
     bail!(
-        "unrecognized kernel image: no ELF magic at 0 and no bzImage \
-         HdrS magic at {BZIMAGE_MAGIC_OFFSET:#x}"
+        "unrecognized kernel image: no ELF magic at 0, no Multiboot2 \
+         header and no bzImage HdrS magic at {BZIMAGE_MAGIC_OFFSET:#x}"
     )
 }
 
@@ -65,6 +77,8 @@ pub enum BootImage {
     Bzimage(KernelImage),
     /// PVH-capable ELF64, 32-bit protected-mode entry.
     Pvh(PvhKernel),
+    /// Multiboot2 kernel, 32-bit protected-mode entry.
+    Multiboot2(Multiboot2Kernel),
 }
 
 impl BootImage {
@@ -78,6 +92,9 @@ impl BootImage {
                 Ok(Self::Bzimage(KernelImage::from_bytes(data)?))
             }
             BootProtocol::Pvh => Ok(Self::Pvh(PvhKernel::from_bytes(data)?)),
+            BootProtocol::Multiboot2 => {
+                Ok(Self::Multiboot2(Multiboot2Kernel::from_bytes(data)?))
+            }
         }
     }
 
@@ -86,6 +103,7 @@ impl BootImage {
         match self {
             Self::Bzimage(_) => BootProtocol::Bzimage,
             Self::Pvh(_) => BootProtocol::Pvh,
+            Self::Multiboot2(_) => BootProtocol::Multiboot2,
         }
     }
 
@@ -94,6 +112,7 @@ impl BootImage {
         match self {
             Self::Bzimage(k) => k.entry_point_64(),
             Self::Pvh(k) => u64::from(k.entry_point_32()),
+            Self::Multiboot2(k) => u64::from(k.entry_point_32()),
         }
     }
 
@@ -127,6 +146,15 @@ impl BootImage {
                 acpi_rsdp_addr,
             )
             .map(u64::from),
+            Self::Multiboot2(k) => crate::multiboot2::load_multiboot2_kernel(
+                mem,
+                k,
+                cmdline,
+                initrd,
+                mem_size,
+                acpi_rsdp_addr,
+            )
+            .map(u64::from),
         }
     }
 
@@ -140,6 +168,10 @@ impl BootImage {
                 crate::setup_direct_boot_bsp(vcpu, k.entry_point_64())
             }
             Self::Pvh(k) => crate::setup_pvh_bsp(vcpu, k.entry_point_32()),
+            Self::Multiboot2(k) => crate::multiboot2::setup_multiboot2_bsp(
+                vcpu,
+                k.entry_point_32(),
+            ),
         }
     }
 }

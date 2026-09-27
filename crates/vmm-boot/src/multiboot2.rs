@@ -1,0 +1,545 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! Multiboot2 direct boot, for kernels such as illumos `unix`.
+//!
+//! The kernel is entered in 32-bit protected mode with paging off, `EAX`
+//! holding the Multiboot2 bootloader magic and `EBX` the address of the
+//! boot information structure (MBI). The image is placed with the header's
+//! address tag, so an ELF64 kernel whose loadable code is 32-bit (illumos
+//! dboot) boots without the VMM interpreting its program headers.
+//!
+//! The optional initrd becomes the single module, tagged `type=rootfs`,
+//! which is what illumos dboot expects of a boot archive. Boot properties
+//! travel on the command line (`-B name=value,...`).
+//!
+//! # Guest memory layout
+//!
+//! ```text
+//! 0x0000_1000  MBI (tags, up to MB2_MBI_MAX bytes)
+//! 0x0000_6000  GDT (null + 32-bit code + 32-bit data)
+//! <from tag>   kernel image, header address tag load_addr ..
+//! high mem     module (page-aligned, below the lowmem ceiling)
+//! ```
+
+use anyhow::{bail, ensure, Context, Result};
+
+use vmm_core::mem::MemCtx;
+use vmm_devices::acpi;
+
+use crate::bsp::{
+    self, FlatSegments, CR0_ET, CR0_PE, GDT_DATA, RFLAGS_RESERVED_BIT1,
+    SEG_TYPE_CODE_XRA,
+};
+use crate::direct::CMDLINE_MAX;
+use crate::{BootVcpu, ImageBytes, InitrdImage};
+
+// ── Guest physical addresses ────────────────────────────────────────
+
+const MB2_GPA_MBI: u64 = 0x1000;
+/// The MBI must end before the GDT.
+const MB2_MBI_MAX: usize = 0x5000;
+const MB2_GPA_GDT: u64 = 0x6000;
+
+// ── Multiboot2 ABI ──────────────────────────────────────────────────
+
+/// Header magic, searched for in the first 32 KiB of the image.
+pub const MB2_HEADER_MAGIC: u32 = 0xE852_50D6;
+/// Value in `EAX` on entry.
+pub const MB2_BOOTLOADER_MAGIC: u32 = 0x36D7_6289;
+const MB2_SEARCH: usize = 32768;
+const MB2_ARCH_I386: u32 = 0;
+
+const HDR_TAG_END: u16 = 0;
+const HDR_TAG_ADDRESS: u16 = 2;
+const HDR_TAG_ENTRY_ADDRESS: u16 = 3;
+
+const TAG_END: u32 = 0;
+const TAG_CMDLINE: u32 = 1;
+const TAG_BOOT_LOADER_NAME: u32 = 2;
+const TAG_MODULE: u32 = 3;
+const TAG_BASIC_MEMINFO: u32 = 4;
+const TAG_MMAP: u32 = 6;
+const TAG_ACPI_OLD: u32 = 14;
+const TAG_ACPI_NEW: u32 = 15;
+
+const MMAP_ENTRY_SIZE: u32 = 24;
+const ROOTFS_MODULE_CMDLINE: &str =
+    "/platform/i86pc/amd64/boot_archive type=rootfs";
+const LOADER_NAME: &str = "rshyve multiboot2";
+
+// ── GDT ─────────────────────────────────────────────────────────────
+
+/// 32-bit code: base 0, limit 0xFFFFF, type 0x0B, S=1, P=1, D/B=1, G=1.
+const GDT_CODE32: u64 = 0x00CF_9B00_0000_FFFF;
+const MB2_GDT_SIZE: usize = 24;
+const MB2_GDTR_LIMIT: u32 = (MB2_GDT_SIZE as u32) - 1;
+
+// ── Image ───────────────────────────────────────────────────────────
+
+/// A kernel image carrying a Multiboot2 header with address and entry
+/// address tags.
+pub struct Multiboot2Kernel {
+    data: ImageBytes,
+    /// File offset of the first byte copied to `load_addr`.
+    src_off: usize,
+    load_addr: u32,
+    /// Bytes copied from the file.
+    load_len: usize,
+    /// End of the zeroed BSS, or `load_addr + load_len` when there is none.
+    bss_end: u32,
+    entry: u32,
+}
+
+impl std::fmt::Debug for Multiboot2Kernel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Multiboot2Kernel")
+            .field("src_off", &self.src_off)
+            .field("load_addr", &format_args!("{:#x}", self.load_addr))
+            .field("load_len", &self.load_len)
+            .field("bss_end", &format_args!("{:#x}", self.bss_end))
+            .field("entry", &format_args!("{:#x}", self.entry))
+            .finish()
+    }
+}
+
+fn le32(data: &[u8], off: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(data.get(off..off + 4)?.try_into().ok()?))
+}
+
+fn le16(data: &[u8], off: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(data.get(off..off + 2)?.try_into().ok()?))
+}
+
+/// File offset of a valid Multiboot2 header, if the image has one.
+pub fn find_multiboot2_header(data: &[u8]) -> Option<usize> {
+    let limit = data.len().min(MB2_SEARCH);
+    (0..limit.saturating_sub(16)).step_by(8).find(|&off| {
+        let (Some(magic), Some(arch), Some(len), Some(sum)) = (
+            le32(data, off),
+            le32(data, off + 4),
+            le32(data, off + 8),
+            le32(data, off + 12),
+        ) else {
+            return false;
+        };
+        magic == MB2_HEADER_MAGIC
+            && magic.wrapping_add(arch).wrapping_add(len).wrapping_add(sum) == 0
+    })
+}
+
+impl Multiboot2Kernel {
+    pub fn from_bytes(data: impl Into<ImageBytes>) -> Result<Self> {
+        let data = data.into();
+        let bytes: &[u8] = &data;
+        let hdr = find_multiboot2_header(bytes)
+            .context("no Multiboot2 header in the first 32 KiB")?;
+        let arch = le32(bytes, hdr + 4).expect("header was bounds-checked");
+        ensure!(
+            arch == MB2_ARCH_I386,
+            "Multiboot2 architecture {arch} is not i386"
+        );
+        let hdr_len =
+            le32(bytes, hdr + 8).expect("header was bounds-checked") as usize;
+        let hdr_end = hdr
+            .checked_add(hdr_len)
+            .context("header length overflows")?;
+        ensure!(
+            hdr_end <= bytes.len(),
+            "Multiboot2 header runs past the image"
+        );
+
+        let mut address = None;
+        let mut entry = None;
+        let mut tag = hdr + 16;
+        while tag + 8 <= hdr_end {
+            let ty = le16(bytes, tag).context("truncated header tag")?;
+            let size =
+                le32(bytes, tag + 4).context("truncated header tag")? as usize;
+            ensure!(
+                size >= 8 && tag + size <= hdr_end,
+                "malformed header tag at {tag:#x}"
+            );
+            match ty {
+                HDR_TAG_END => break,
+                HDR_TAG_ADDRESS => {
+                    ensure!(size >= 24, "short address tag");
+                    address = Some([
+                        le32(bytes, tag + 8).expect("bounded"),
+                        le32(bytes, tag + 12).expect("bounded"),
+                        le32(bytes, tag + 16).expect("bounded"),
+                        le32(bytes, tag + 20).expect("bounded"),
+                    ]);
+                }
+                HDR_TAG_ENTRY_ADDRESS => {
+                    ensure!(size >= 12, "short entry address tag");
+                    entry = Some(le32(bytes, tag + 8).expect("bounded"));
+                }
+                _ => {}
+            }
+            tag += (size + 7) & !7;
+        }
+
+        // ELF-only Multiboot2 kernels need a loader that interprets the
+        // program headers; the tags make placement explicit and are what
+        // illumos provides, so require them.
+        let [header_addr, load_addr, load_end_addr, bss_end_addr] =
+            address.context("Multiboot2 header has no address tag")?;
+        let entry =
+            entry.context("Multiboot2 header has no entry address tag")?;
+        let delta = header_addr
+            .checked_sub(load_addr)
+            .context("header_addr below load_addr")?
+            as usize;
+        let src_off = hdr
+            .checked_sub(delta)
+            .context("load_addr precedes the start of the image")?;
+        let load_len = if load_end_addr == 0 {
+            bytes.len() - src_off
+        } else {
+            load_end_addr
+                .checked_sub(load_addr)
+                .context("load_end_addr below load_addr")? as usize
+        };
+        ensure!(
+            src_off + load_len <= bytes.len(),
+            "load range exceeds the image"
+        );
+        let load_end = load_addr as u64 + load_len as u64;
+        ensure!(
+            load_end <= u64::from(u32::MAX),
+            "image does not fit below 4 GiB"
+        );
+        let bss_end = if bss_end_addr == 0 {
+            load_end as u32
+        } else {
+            bss_end_addr
+        };
+        ensure!(
+            u64::from(bss_end) >= load_end,
+            "bss_end_addr below the loaded image"
+        );
+        ensure!(
+            entry >= load_addr && u64::from(entry) < load_end,
+            "entry {entry:#x} lies outside the loaded image"
+        );
+        Ok(Self {
+            data,
+            src_off,
+            load_addr,
+            load_len,
+            bss_end,
+            entry,
+        })
+    }
+
+    pub fn entry_point_32(&self) -> u32 {
+        self.entry
+    }
+
+    /// First byte past the image and its BSS.
+    pub fn load_end(&self) -> u64 {
+        u64::from(self.bss_end)
+    }
+}
+
+// ── MBI builder ─────────────────────────────────────────────────────
+
+struct Mbi(Vec<u8>);
+
+impl Mbi {
+    fn new() -> Self {
+        // total_size and reserved, filled in by finish().
+        Self(vec![0; 8])
+    }
+
+    fn tag(&mut self, ty: u32, body: &[u8]) {
+        let size = 8 + body.len();
+        self.0.extend_from_slice(&ty.to_le_bytes());
+        self.0.extend_from_slice(&(size as u32).to_le_bytes());
+        self.0.extend_from_slice(body);
+        while !self.0.len().is_multiple_of(8) {
+            self.0.push(0);
+        }
+    }
+
+    fn string_tag(&mut self, ty: u32, s: &str) {
+        let mut body = s.as_bytes().to_vec();
+        body.push(0);
+        self.tag(ty, &body);
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        self.tag(TAG_END, &[]);
+        let total = self.0.len() as u32;
+        self.0[0..4].copy_from_slice(&total.to_le_bytes());
+        self.0
+    }
+}
+
+/// Load a Multiboot2 kernel, an optional rootfs module, the GDT and MBI.
+///
+/// Returns the 32-bit entry point. Must run after the ACPI tables are
+/// placed: the RSDP is copied into the MBI.
+pub fn load_multiboot2_kernel(
+    mem: &MemCtx,
+    kernel: &Multiboot2Kernel,
+    cmdline: &str,
+    initrd: Option<&InitrdImage>,
+    mem_size: usize,
+    acpi_rsdp_addr: u64,
+) -> Result<u32> {
+    // 1. The image, straight from the file when there is one. The BSS
+    //    relies on guest RAM starting zeroed.
+    let load_addr = u64::from(kernel.load_addr);
+    match kernel.data.file() {
+        Some(file) => mem
+            .load_from_file(
+                load_addr,
+                file,
+                kernel.src_off as u64,
+                kernel.load_len,
+            )
+            .context("failed to load the Multiboot2 image")?,
+        None => {
+            let bytes =
+                &kernel.data[kernel.src_off..kernel.src_off + kernel.load_len];
+            mem.write_bulk(load_addr, bytes)
+                .context("failed to write the Multiboot2 image")?;
+        }
+    }
+
+    ensure!(
+        cmdline.len() < CMDLINE_MAX,
+        "cmdline too long (max {CMDLINE_MAX})"
+    );
+
+    // 2. The module, page-aligned (illumos asks for module alignment).
+    let module = match initrd {
+        Some(rd) => {
+            let addr =
+                crate::place_initrd(mem_size, rd.len(), kernel.load_end())?;
+            mem.write_bulk(addr, rd.as_bytes())
+                .context("failed to write the module")?;
+            Some((addr, rd.len() as u64))
+        }
+        None => None,
+    };
+
+    // 3. GDT.
+    let mut gdt = [0u8; MB2_GDT_SIZE];
+    gdt[8..16].copy_from_slice(&GDT_CODE32.to_le_bytes());
+    gdt[16..24].copy_from_slice(&GDT_DATA.to_le_bytes());
+    mem.write(MB2_GPA_GDT, &gdt)
+        .context("failed to write GDT")?;
+
+    // 4. MBI.
+    let e820 = acpi::build_e820_entries(mem_size);
+    let mut mbi = Mbi::new();
+    mbi.string_tag(TAG_CMDLINE, cmdline);
+    mbi.string_tag(TAG_BOOT_LOADER_NAME, LOADER_NAME);
+    if let Some((addr, len)) = module {
+        let end = addr + len;
+        ensure!(
+            end <= u64::from(u32::MAX),
+            "module does not fit below 4 GiB"
+        );
+        let mut body = Vec::new();
+        body.extend_from_slice(&(addr as u32).to_le_bytes());
+        body.extend_from_slice(&(end as u32).to_le_bytes());
+        body.extend_from_slice(ROOTFS_MODULE_CMDLINE.as_bytes());
+        body.push(0);
+        mbi.tag(TAG_MODULE, &body);
+    }
+
+    // Basic meminfo: KiB below 1 MiB and KiB of contiguous RAM above it.
+    let mut lower = 0u64;
+    let mut upper = 0u64;
+    for entry in &e820 {
+        let (addr, size, type_) = (entry.addr, entry.size, entry.type_);
+        if type_ != 1 {
+            continue;
+        }
+        if addr == 0 {
+            lower = size / 1024;
+        } else if addr == 0x10_0000 {
+            upper = size / 1024;
+        }
+    }
+    let mut meminfo = Vec::new();
+    meminfo.extend_from_slice(&(lower.min(640) as u32).to_le_bytes());
+    meminfo.extend_from_slice(
+        &(upper.min(u64::from(u32::MAX)) as u32).to_le_bytes(),
+    );
+    mbi.tag(TAG_BASIC_MEMINFO, &meminfo);
+
+    let mut mmap = Vec::new();
+    mmap.extend_from_slice(&MMAP_ENTRY_SIZE.to_le_bytes());
+    mmap.extend_from_slice(&0u32.to_le_bytes()); // entry_version
+    for entry in &e820 {
+        // E820Entry is packed, so copy each field out before use. The
+        // Multiboot2 memory types are the E820 types.
+        let (addr, size, type_) = (entry.addr, entry.size, entry.type_);
+        mmap.extend_from_slice(&addr.to_le_bytes());
+        mmap.extend_from_slice(&size.to_le_bytes());
+        mmap.extend_from_slice(&type_.to_le_bytes());
+        mmap.extend_from_slice(&0u32.to_le_bytes());
+    }
+    mbi.tag(TAG_MMAP, &mmap);
+
+    if acpi_rsdp_addr != 0 {
+        let mut rsdp = [0u8; 36];
+        mem.read(acpi_rsdp_addr, &mut rsdp)
+            .context("failed to read the RSDP")?;
+        match rsdp[15] {
+            0 => mbi.tag(TAG_ACPI_OLD, &rsdp[..20]),
+            rev if rev >= 2 => mbi.tag(TAG_ACPI_NEW, &rsdp),
+            rev => bail!("unexpected RSDP revision {rev}"),
+        }
+    }
+
+    let mbi = mbi.finish();
+    ensure!(
+        mbi.len() <= MB2_MBI_MAX,
+        "MBI of {} bytes overruns the GDT",
+        mbi.len()
+    );
+    mem.write(MB2_GPA_MBI, &mbi)
+        .context("failed to write the MBI")?;
+
+    Ok(kernel.entry_point_32())
+}
+
+// ── BSP setup ───────────────────────────────────────────────────────
+
+/// Configure vCPU 0 for Multiboot2 entry: 32-bit protected mode, paging
+/// off, `EAX` = bootloader magic, `EBX` = MBI.
+pub fn setup_multiboot2_bsp<V: BootVcpu + ?Sized>(
+    vcpu: &V,
+    entry32: u32,
+) -> Result<()> {
+    use bhyve_api::{
+        vm_reg_name::*, SEG_ACCESS_DB, SEG_ACCESS_G, SEG_ACCESS_P, SEG_ACCESS_S,
+    };
+
+    vcpu.reboot_state().context("reboot_state")?;
+
+    vcpu.set_reg(VM_REG_GUEST_CR0, CR0_PE | CR0_ET)?;
+    vcpu.set_reg(VM_REG_GUEST_CR3, 0)?;
+    vcpu.set_reg(VM_REG_GUEST_CR4, 0)?;
+    vcpu.set_reg(VM_REG_GUEST_EFER, 0)?;
+
+    bsp::program_flat_segments(
+        vcpu,
+        &FlatSegments {
+            code_access: SEG_ACCESS_P
+                | SEG_ACCESS_S
+                | SEG_ACCESS_DB
+                | SEG_ACCESS_G
+                | SEG_TYPE_CODE_XRA,
+            gdt_base: MB2_GPA_GDT,
+            gdt_limit: MB2_GDTR_LIMIT,
+        },
+    )?;
+
+    vcpu.set_reg(VM_REG_GUEST_RIP, u64::from(entry32))?;
+    vcpu.set_reg(VM_REG_GUEST_RFLAGS, RFLAGS_RESERVED_BIT1)?;
+    vcpu.set_reg(VM_REG_GUEST_RBX, MB2_GPA_MBI)?;
+    bsp::zero_gprs(vcpu, VM_REG_GUEST_RBX)?;
+    vcpu.set_reg(VM_REG_GUEST_RAX, u64::from(MB2_BOOTLOADER_MAGIC))?;
+
+    vcpu.set_run_state(bhyve_api::VRS_RUN)?;
+    Ok(())
+}
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A synthetic image laid out like illumos amd64 `unix`: the header at
+    /// file offset 0x190 with header_addr 0xc00038, so load_addr maps file
+    /// offset 0.
+    fn image() -> Vec<u8> {
+        let mut img = vec![0u8; 0x1000];
+        let hdr = 0x190;
+        let tags: Vec<u8> = [
+            // address tag
+            &[2u8, 0, 0, 0, 24, 0, 0, 0][..],
+            &0xc0_0038u32.to_le_bytes(),
+            &0xbf_fea8u32.to_le_bytes(),
+            &0u32.to_le_bytes(),
+            &0u32.to_le_bytes(),
+            // entry address tag, padded to 8
+            &[3u8, 0, 0, 0, 12, 0, 0, 0],
+            &0xc0_0100u32.to_le_bytes(),
+            &[0u8; 4],
+            // end tag
+            &[0u8, 0, 0, 0, 8, 0, 0, 0],
+        ]
+        .concat();
+        let len = 16 + tags.len() as u32;
+        let sum = 0u32.wrapping_sub(MB2_HEADER_MAGIC.wrapping_add(len));
+        img[hdr..hdr + 4].copy_from_slice(&MB2_HEADER_MAGIC.to_le_bytes());
+        img[hdr + 8..hdr + 12].copy_from_slice(&len.to_le_bytes());
+        img[hdr + 12..hdr + 16].copy_from_slice(&sum.to_le_bytes());
+        img[hdr + 16..hdr + 16 + tags.len()].copy_from_slice(&tags);
+        img
+    }
+
+    #[test]
+    fn finds_header_and_derives_placement() {
+        let k = Multiboot2Kernel::from_bytes(image()).expect("parsed");
+        assert_eq!(k.src_off, 0);
+        assert_eq!(k.load_addr, 0xbf_fea8);
+        assert_eq!(k.load_len, 0x1000);
+        assert_eq!(k.entry_point_32(), 0xc0_0100);
+        assert_eq!(k.load_end(), 0xbf_fea8 + 0x1000);
+    }
+
+    #[test]
+    fn rejects_bad_checksum() {
+        let mut img = image();
+        img[0x19c] ^= 1;
+        assert!(find_multiboot2_header(&img).is_none());
+    }
+
+    #[test]
+    fn rejects_entry_outside_image() {
+        let mut img = image();
+        // entry tag body starts at 0x190 + 16 + 24 + 8
+        let at = 0x190 + 16 + 24 + 8;
+        img[at..at + 4].copy_from_slice(&0x10_0000u32.to_le_bytes());
+        let err = Multiboot2Kernel::from_bytes(img).expect_err("entry outside");
+        assert!(
+            err.to_string().contains("outside the loaded image"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn mbi_tags_are_eight_byte_aligned_and_sized() {
+        let mut mbi = Mbi::new();
+        mbi.string_tag(TAG_CMDLINE, "unix -B console=ttya");
+        mbi.tag(TAG_BASIC_MEMINFO, &[0; 8]);
+        let out = mbi.finish();
+        assert_eq!(
+            u32::from_le_bytes(out[0..4].try_into().unwrap()) as usize,
+            out.len()
+        );
+        let mut off = 8;
+        let mut types = Vec::new();
+        while off < out.len() {
+            let ty = u32::from_le_bytes(out[off..off + 4].try_into().unwrap());
+            let size =
+                u32::from_le_bytes(out[off + 4..off + 8].try_into().unwrap())
+                    as usize;
+            types.push(ty);
+            off += (size + 7) & !7;
+            assert_eq!(off % 8, 0);
+        }
+        assert_eq!(types, vec![TAG_CMDLINE, TAG_BASIC_MEMINFO, TAG_END]);
+    }
+}
