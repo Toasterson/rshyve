@@ -168,11 +168,9 @@ impl BootImage {
                 crate::setup_direct_boot_bsp(vcpu, k.entry_point_64())
             }
             Self::Pvh(k) => crate::setup_pvh_bsp(vcpu, k.entry_point_32()),
-            // The BSP starts in the firmware prologue, which jumps to the
-            // kernel entry once PCI decoding is enabled.
-            Self::Multiboot2(_) => crate::multiboot2::setup_multiboot2_bsp(
+            Self::Multiboot2(k) => crate::multiboot2::setup_multiboot2_bsp(
                 vcpu,
-                crate::multiboot2::MB2_PROLOGUE_GPA,
+                k.entry_point_32(),
             ),
         }
     }
