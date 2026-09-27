@@ -22,6 +22,7 @@
 //! 0x0000_6000  GDT (null + 32-bit code + 32-bit data)
 //! <from tag>   kernel image, header address tag load_addr ..
 //! 0x000F_8000  legacy BIOS shim (real-mode handlers)
+//! 0x000F_8040  firmware prologue (32-bit), the BSP's first instruction
 //! <above image> module (page-aligned, directly above the kernel)
 //! ```
 //!
@@ -35,6 +36,16 @@
 //! handler set: PCI BIOS present (`AX=B101h`) reports configuration
 //! mechanism 1 on bus 0, and every other call returns carry set
 //! (function not supported), which each caller already handles.
+//!
+//! # Firmware prologue
+//!
+//! Firmware leaves PCI devices with I/O, memory and bus-master decoding
+//! enabled. illumos drivers on a conventional PCI bus rely on that and do
+//! not set bus mastering themselves, so without firmware their DMA never
+//! reaches memory (vioblk waits forever, nvme I/O fails with EIO). The BSP
+//! therefore starts in a short 32-bit prologue that sets those three
+//! command bits on every present function 0 of bus 0 through configuration
+//! mechanism 1, restores `EAX` and jumps to the kernel entry.
 
 use anyhow::{bail, ensure, Context, Result};
 
@@ -61,6 +72,49 @@ const BIOS_SHIM_SEG: u16 = 0xF800;
 const BIOS_SHIM_GPA: u64 = (BIOS_SHIM_SEG as u64) << 4;
 /// Offset of the `int 1Ah` handler within the shim.
 const BIOS_SHIM_INT1A: u16 = 0x10;
+/// Where the BSP starts: the firmware prologue.
+pub const MB2_PROLOGUE_GPA: u32 = 0xF8040;
+/// Offset of the kernel entry immediate (`mov ecx, imm32`) in the prologue.
+const PROLOGUE_ENTRY_OFF: usize = 0x3F;
+
+/// 32-bit prologue, assembled from:
+///
+/// ```text
+///     mov ebp, eax            ; keep the Multiboot2 magic
+///     xor ecx, ecx            ; device 0..31 on bus 0, function 0
+/// 1:  mov eax, ecx
+///     shl eax, 11
+///     or  eax, 0x80000000
+///     mov esi, eax
+///     mov dx, 0xcf8
+///     out dx, eax
+///     mov dx, 0xcfc
+///     in  eax, dx
+///     cmp ax, 0xffff          ; no device
+///     je  2f
+///     mov eax, esi
+///     or  eax, 4              ; command register
+///     mov dx, 0xcf8
+///     out dx, eax
+///     mov dx, 0xcfc
+///     in  ax, dx
+///     or  ax, 7               ; I/O, memory, bus master
+///     out dx, ax
+/// 2:  inc ecx
+///     cmp ecx, 32
+///     jb  1b
+///     mov eax, ebp
+///     mov ecx, <kernel entry>
+///     jmp ecx
+/// ```
+const PROLOGUE: [u8; 0x45] = [
+    0x89, 0xC5, 0x31, 0xC9, 0x89, 0xC8, 0xC1, 0xE0, 0x0B, 0x0D, 0x00, 0x00,
+    0x00, 0x80, 0x89, 0xC6, 0x66, 0xBA, 0xF8, 0x0C, 0xEF, 0x66, 0xBA, 0xFC,
+    0x0C, 0xED, 0x66, 0x83, 0xF8, 0xFF, 0x74, 0x16, 0x89, 0xF0, 0x83, 0xC8,
+    0x04, 0x66, 0xBA, 0xF8, 0x0C, 0xEF, 0x66, 0xBA, 0xFC, 0x0C, 0x66, 0xED,
+    0x66, 0x83, 0xC8, 0x07, 0x66, 0xEF, 0x41, 0x83, 0xF9, 0x20, 0x72, 0xC8,
+    0x89, 0xE8, 0xB9, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xE1,
+];
 
 /// Real-mode handlers. Offset 0: any vector, `stc; mov ah,86h; retf 2`.
 /// Offset 0x10: `int 1Ah`, PCI BIOS present for `AX=B101h` (AL=1:
@@ -397,6 +451,11 @@ pub fn load_multiboot2_kernel(
         entry[2..4].copy_from_slice(&BIOS_SHIM_SEG.to_le_bytes());
     }
     mem.write(0, &ivt).context("failed to write the IVT")?;
+    let mut prologue = PROLOGUE;
+    prologue[PROLOGUE_ENTRY_OFF..PROLOGUE_ENTRY_OFF + 4]
+        .copy_from_slice(&kernel.entry_point_32().to_le_bytes());
+    mem.write(u64::from(MB2_PROLOGUE_GPA), &prologue)
+        .context("failed to write the firmware prologue")?;
 
     // 4. GDT.
     let mut gdt = [0u8; MB2_GDT_SIZE];
@@ -587,6 +646,25 @@ mod tests {
         let target = jne + 2 + BIOS_SHIM[jne + 1] as usize;
         assert_eq!(&BIOS_SHIM[target..target + 3], &[0xF9, 0xB4, 0x81]);
         assert_eq!(BIOS_SHIM_GPA, 0xF8000);
+    }
+
+    #[test]
+    fn prologue_matches_its_listing() {
+        // mov ecx, imm32 then jmp ecx at the end; the je/jb targets stay
+        // inside the loop.
+        assert_eq!(PROLOGUE[PROLOGUE_ENTRY_OFF - 1], 0xB9);
+        assert_eq!(&PROLOGUE[PROLOGUE.len() - 2..], &[0xFF, 0xE1]);
+        let je = 0x1E;
+        assert_eq!(PROLOGUE[je], 0x74);
+        assert_eq!(je + 2 + PROLOGUE[je + 1] as usize, 0x36); // inc ecx
+        let jb = 0x3A;
+        assert_eq!(PROLOGUE[jb], 0x72);
+        assert_eq!((jb as i32) + 2 + (PROLOGUE[jb + 1] as i8) as i32, 0x04);
+        // The prologue sits after the BIOS shim.
+        assert!(
+            BIOS_SHIM_GPA as usize + BIOS_SHIM.len()
+                <= MB2_PROLOGUE_GPA as usize
+        );
     }
 
     #[test]
