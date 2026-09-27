@@ -23,6 +23,7 @@
 //! <from tag>   kernel image, header address tag load_addr ..
 //! 0x000F_8000  legacy BIOS shim (real-mode handlers)
 //! 0x000F_8040  firmware prologue (32-bit), the BSP's first instruction
+//! 0x000F_FFF5  BIOS date string "mm/dd/yy" and model byte at 0xFFFFE
 //! <above image> module (page-aligned, directly above the kernel)
 //! ```
 //!
@@ -36,6 +37,17 @@
 //! handler set: PCI BIOS present (`AX=B101h`) reports configuration
 //! mechanism 1 on bus 0, and every other call returns carry set
 //! (function not supported), which each caller already handles.
+//!
+//! # BIOS date
+//!
+//! On a boot without EFI tags illumos decides whether ACPI exists by reading
+//! the BIOS ROM date at 0xFFFF5 (`acpica_check_bios_date`) and accepts only
+//! 1999 or later. With no ROM behind the address it turns ACPI off, both APIC
+//! platform modules fail to initialise ACPICA, and the kernel falls back to
+//! the uniprocessor 8259 module: no SMP, no MSI/MSI-X, and legacy interrupts
+//! nobody routes. The VMM therefore writes a date string and the AT model byte
+//! there, like any BIOS ROM. (`-B acpi-user-options=0x1` is the guest-side
+//! workaround.)
 //!
 //! # Firmware prologue
 //!
@@ -72,6 +84,12 @@ const BIOS_SHIM_SEG: u16 = 0xF800;
 const BIOS_SHIM_GPA: u64 = (BIOS_SHIM_SEG as u64) << 4;
 /// Offset of the `int 1Ah` handler within the shim.
 const BIOS_SHIM_INT1A: u16 = 0x10;
+/// BIOS ROM date string, read by illumos to decide whether ACPI can be used.
+const BIOS_DATE_GPA: u64 = 0xFFFF5;
+const BIOS_DATE: &[u8; 8] = b"09/27/26";
+/// PC/AT model byte.
+const BIOS_MODEL_GPA: u64 = 0xFFFFE;
+const BIOS_MODEL_AT: u8 = 0xFC;
 /// Where the BSP starts: the firmware prologue.
 pub const MB2_PROLOGUE_GPA: u32 = 0xF8040;
 /// Offset of the kernel entry immediate (`mov ecx, imm32`) in the prologue.
@@ -451,6 +469,10 @@ pub fn load_multiboot2_kernel(
         entry[2..4].copy_from_slice(&BIOS_SHIM_SEG.to_le_bytes());
     }
     mem.write(0, &ivt).context("failed to write the IVT")?;
+    mem.write(BIOS_DATE_GPA, BIOS_DATE)
+        .context("failed to write the BIOS date")?;
+    mem.write(BIOS_MODEL_GPA, &[BIOS_MODEL_AT])
+        .context("failed to write the BIOS model byte")?;
     let mut prologue = PROLOGUE;
     prologue[PROLOGUE_ENTRY_OFF..PROLOGUE_ENTRY_OFF + 4]
         .copy_from_slice(&kernel.entry_point_32().to_le_bytes());
