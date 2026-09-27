@@ -278,6 +278,24 @@ impl Mbi {
     }
 }
 
+/// Page-aligned module address directly above `load_end`, below the
+/// lowmem ceiling.
+fn place_module(mem_size: usize, len: usize, load_end: u64) -> Result<u64> {
+    let addr = load_end
+        .checked_add(0xFFF)
+        .context("module placement overflows")?
+        & !0xFFF;
+    let end = addr
+        .checked_add(len as u64)
+        .context("module placement overflows")?;
+    let lowmem_limit = (mem_size as u64).min(crate::LOWMEM_LIMIT);
+    ensure!(
+        end <= lowmem_limit,
+        "module of {len} bytes does not fit above the kernel (need more RAM)"
+    );
+    Ok(addr)
+}
+
 /// Load a Multiboot2 kernel, an optional rootfs module, the GDT and MBI.
 ///
 /// Returns the 32-bit entry point. Must run after the ACPI tables are
@@ -315,11 +333,13 @@ pub fn load_multiboot2_kernel(
         "cmdline too long (max {CMDLINE_MAX})"
     );
 
-    // 2. The module, page-aligned (illumos asks for module alignment).
+    // 2. The module, page-aligned directly above the kernel, as the
+    //    illumos loader places it. dboot allocates its own memory upward
+    //    from the end of the last module, so a module at the top of RAM
+    //    (the Linux initrd placement) leaves dboot nothing to allocate.
     let module = match initrd {
         Some(rd) => {
-            let addr =
-                crate::place_initrd(mem_size, rd.len(), kernel.load_end())?;
+            let addr = place_module(mem_size, rd.len(), kernel.load_end())?;
             mem.write_bulk(addr, rd.as_bytes())
                 .context("failed to write the module")?;
             Some((addr, rd.len() as u64))
@@ -497,6 +517,15 @@ mod tests {
         assert_eq!(k.load_len, 0x1000);
         assert_eq!(k.entry_point_32(), 0xc0_0100);
         assert_eq!(k.load_end(), 0xbf_fea8 + 0x1000);
+    }
+
+    #[test]
+    fn module_sits_directly_above_the_kernel() {
+        let addr = place_module(64 << 20, 4096, 0xc0_1234).expect("placed");
+        assert_eq!(addr, 0xc0_2000);
+        let err = place_module(16 << 20, 8 << 20, 0xc0_0000)
+            .expect_err("module past the end of RAM");
+        assert!(err.to_string().contains("does not fit"), "{err}");
     }
 
     #[test]
