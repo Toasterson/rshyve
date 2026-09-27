@@ -17,11 +17,24 @@
 //! # Guest memory layout
 //!
 //! ```text
+//! 0x0000_0000  real-mode IVT, every vector pointing into the BIOS shim
 //! 0x0000_1000  MBI (tags, up to MB2_MBI_MAX bytes)
 //! 0x0000_6000  GDT (null + 32-bit code + 32-bit data)
 //! <from tag>   kernel image, header address tag load_addr ..
-//! high mem     module (page-aligned, below the lowmem ceiling)
+//! 0x000F_8000  legacy BIOS shim (real-mode handlers)
+//! <above image> module (page-aligned, directly above the kernel)
 //! ```
+//!
+//! # Legacy BIOS shim
+//!
+//! A Multiboot2 boot without EFI tags tells illumos it runs on a legacy
+//! BIOS, and the kernel then issues a few real-mode `int` calls through
+//! its own trampoline: `int 1Ah` for PCI BIOS detection and IRQ routing,
+//! `int 10h` to set the console mode and `int 13h` for BIOS disk data.
+//! There is no firmware behind a direct boot, so the VMM installs a tiny
+//! handler set: PCI BIOS present (`AX=B101h`) reports configuration
+//! mechanism 1 on bus 0, and every other call returns carry set
+//! (function not supported), which each caller already handles.
 
 use anyhow::{bail, ensure, Context, Result};
 
@@ -41,6 +54,33 @@ const MB2_GPA_MBI: u64 = 0x1000;
 /// The MBI must end before the GDT.
 const MB2_MBI_MAX: usize = 0x5000;
 const MB2_GPA_GDT: u64 = 0x6000;
+/// Real-mode segment and physical address of the BIOS shim. Clear of the
+/// SMBIOS entry point and tables (0xF0000, 0xF1000) and the ACPI tables
+/// (0xF2400).
+const BIOS_SHIM_SEG: u16 = 0xF800;
+const BIOS_SHIM_GPA: u64 = (BIOS_SHIM_SEG as u64) << 4;
+/// Offset of the `int 1Ah` handler within the shim.
+const BIOS_SHIM_INT1A: u16 = 0x10;
+
+/// Real-mode handlers. Offset 0: any vector, `stc; mov ah,86h; retf 2`.
+/// Offset 0x10: `int 1Ah`, PCI BIOS present for `AX=B101h` (AL=1:
+/// mechanism 1, BX=0210h, CL=0: last bus, EDX='PCI '), otherwise
+/// `stc; mov ah,81h; retf 2`. `retf 2` drops the pushed FLAGS so the
+/// carry flag reaches the caller.
+const BIOS_SHIM: [u8; 0x10 + 29] = [
+    0xF9, 0xB4, 0x86, 0xCA, 0x02, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x3D,
+    0x01, 0xB1, // cmp ax, 0xB101
+    0x75, 0x12, // jne fail
+    0xB8, 0x01, 0x00, // mov ax, 0x0001
+    0xBB, 0x10, 0x02, // mov bx, 0x0210
+    0xB1, 0x00, // mov cl, 0
+    0x66, 0xBA, 0x50, 0x43, 0x49, 0x20, // mov edx, 'PCI '
+    0xF8, // clc
+    0xCA, 0x02, 0x00, // retf 2
+    0xF9, // fail: stc
+    0xB4, 0x81, // mov ah, 0x81
+    0xCA, 0x02, 0x00, // retf 2
+];
 
 // ── Multiboot2 ABI ──────────────────────────────────────────────────
 
@@ -347,14 +387,25 @@ pub fn load_multiboot2_kernel(
         None => None,
     };
 
-    // 3. GDT.
+    // 3. Legacy BIOS shim and the IVT that points into it.
+    mem.write(BIOS_SHIM_GPA, &BIOS_SHIM)
+        .context("failed to write the BIOS shim")?;
+    let mut ivt = [0u8; 256 * 4];
+    for (vector, entry) in ivt.chunks_exact_mut(4).enumerate() {
+        let offset = if vector == 0x1A { BIOS_SHIM_INT1A } else { 0 };
+        entry[0..2].copy_from_slice(&offset.to_le_bytes());
+        entry[2..4].copy_from_slice(&BIOS_SHIM_SEG.to_le_bytes());
+    }
+    mem.write(0, &ivt).context("failed to write the IVT")?;
+
+    // 4. GDT.
     let mut gdt = [0u8; MB2_GDT_SIZE];
     gdt[8..16].copy_from_slice(&GDT_CODE32.to_le_bytes());
     gdt[16..24].copy_from_slice(&GDT_DATA.to_le_bytes());
     mem.write(MB2_GPA_GDT, &gdt)
         .context("failed to write GDT")?;
 
-    // 4. MBI.
+    // 5. MBI.
     let e820 = acpi::build_e820_entries(mem_size);
     let mut mbi = Mbi::new();
     mbi.string_tag(TAG_CMDLINE, cmdline);
@@ -526,6 +577,16 @@ mod tests {
         let err = place_module(16 << 20, 8 << 20, 0xc0_0000)
             .expect_err("module past the end of RAM");
         assert!(err.to_string().contains("does not fit"), "{err}");
+    }
+
+    #[test]
+    fn bios_shim_jump_lands_on_the_fail_path() {
+        // jne at 0x13 with rel8 0x12 -> target 0x15 + 0x12 = 0x27.
+        let jne = 0x13;
+        assert_eq!(BIOS_SHIM[jne], 0x75);
+        let target = jne + 2 + BIOS_SHIM[jne + 1] as usize;
+        assert_eq!(&BIOS_SHIM[target..target + 3], &[0xF9, 0xB4, 0x81]);
+        assert_eq!(BIOS_SHIM_GPA, 0xF8000);
     }
 
     #[test]
